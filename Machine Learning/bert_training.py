@@ -15,10 +15,12 @@ import evaluate
 
 # Initializing a list of Models
 map_of_models = {"BERT": "bert-base-uncased",
-                 "RoBERTa": "FacebookAI/roberta-base"}
+                 "RoBERTa": "FacebookAI/roberta-base",
+                 "AlBERT": "albert-base-v2",
+                 "DistilBERT": "distilbert-base-uncased"}
 
 # Initializing the tokenizer
-model_name = "RoBERTa"
+model_name = "AlBERT"
 tokenizer = AutoTokenizer.from_pretrained(map_of_models[model_name])
 model = AutoModelForSequenceClassification.from_pretrained(map_of_models[model_name], num_labels = 28)
 cce = evaluate.load("accuracy")
