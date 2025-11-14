@@ -71,7 +71,7 @@ def load_predictor(run_card: Dict):
             return probs
         return predict, predict_proba, class_names, family
 
-    # ----- Prefer labels from config.json if available (guarantees correct mapping)
+    # ----- Prefer labels from config.json
     cfg_path = os.path.join(path, "config.json")
     if os.path.exists(cfg_path):
         try:
@@ -82,7 +82,7 @@ def load_predictor(run_card: Dict):
         except Exception:
             pass
 
-    # ----- Tokenizer source: folder if tokenizer files exist; else fallback to tokenizer_name in run_card
+    # ----- Tokenizer source
     has_tok = any(os.path.exists(os.path.join(path, fn)) for fn in ("tokenizer.json","vocab.txt","spiece.model"))
     tok_src = path if has_tok else run_card.get("tokenizer_name", path)
 
