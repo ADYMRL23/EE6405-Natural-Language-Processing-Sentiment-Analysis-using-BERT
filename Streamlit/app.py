@@ -183,11 +183,11 @@ with tab_all:
                 # "family": rc.get("family"),
                 "model": rc.get("model_name"),
                 "tokenizer": rc.get("tokenizer_name"),
-                "accuracy": m.get("accuracy"),
+                # "accuracy": m.get("accuracy"),
                 "n_classes": len(rc.get("label_classes", [])),
                 "path": rc.get("_path")
             })
-        df_runs = pd.DataFrame(rows).sort_values(["accuracy"], ascending=[False])
+        df_runs = pd.DataFrame(rows)
         st.dataframe(df_runs, use_container_width=True)
         st.download_button("Download runs table (CSV)", df_runs.to_csv(index=False), "all_runs.csv", "text/csv")
 
