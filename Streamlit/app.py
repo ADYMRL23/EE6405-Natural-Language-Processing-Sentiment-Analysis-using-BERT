@@ -1,7 +1,8 @@
-# Streamlit FRONTEND to browse checkpoints and run single-text predictions
+# Streamlit FRONTEND to browse checkpoints and run predictions
 
 import os, json
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -9,10 +10,10 @@ import streamlit as st
 
 import joblib
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import pipeline
 
 # -------------------- App config
-st.set_page_config(page_title="Sentiment/Emotion Viewer", layout="wide")
+st.set_page_config(page_title="Sentiment/Emotion Prediction", layout="wide")
 ARTIFACTS_DIR = "artifacts"
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
@@ -34,10 +35,6 @@ def discover_runs(art_dir: str = ARTIFACTS_DIR) -> Dict[str, Dict]:
                 pass
     return found
 
-def softmax(x: np.ndarray) -> np.ndarray:
-    e = np.exp(x - x.max(axis=-1, keepdims=True))
-    return e / e.sum(axis=-1, keepdims=True)
-
 def _cuda_ok() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -47,70 +44,87 @@ def _cuda_ok() -> bool:
     except Exception:
         return False
 
+@st.cache_resource
+def _cached_pipe(model_dir: str, tokenizer_src: str, use_cuda: bool):
+    return pipeline(
+        task="text-classification",
+        model=model_dir,
+        tokenizer=tokenizer_src,
+        device=0 if use_cuda else -1,
+        return_all_scores=True,   # get scores for all labels
+        truncation=True
+    )
+
 def load_predictor(run_card: Dict):
-    """Return (predict_fn, predict_proba_fn, class_names, family) for the selected checkpoint."""
+    """
+    Return (predict, predict_proba, class_names, family)
+    using a HF pipeline.
+    """
     path = run_card["_path"]
-    class_names = run_card["label_classes"]
-    family = run_card["family"]
+    family = "transformer"
 
-    if family == "baseline":
-        pipe = joblib.load(os.path.join(path, "model.joblib"))
-        def predict(texts: List[str]) -> np.ndarray:
-            return pipe.predict(texts)
-        def predict_proba(texts: List[str]) -> np.ndarray:
-            if hasattr(pipe, "predict_proba"):
-                return pipe.predict_proba(texts)
-            if hasattr(pipe, "decision_function"):
-                scores = pipe.decision_function(texts)
-                scores = np.atleast_2d(scores)
-                e = np.exp(scores - scores.max(axis=-1, keepdims=True))
-                return e / e.sum(axis=-1, keepdims=True)
-            preds = pipe.predict(texts)
-            probs = np.zeros((len(preds), len(class_names)))
-            for i, p in enumerate(preds): probs[i, int(p)] = 1.0
-            return probs
-        return predict, predict_proba, class_names, family
-
-    # ----- Prefer labels from config.json
-    cfg_path = os.path.join(path, "config.json")
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-            if "id2label" in cfg and "num_labels" in cfg:
-                class_names = [cfg["id2label"][str(i)] for i in range(cfg["num_labels"])]
-        except Exception:
-            pass
-
-    # ----- Tokenizer source
-    has_tok = any(os.path.exists(os.path.join(path, fn)) for fn in ("tokenizer.json","vocab.txt","spiece.model"))
+    # Tokenizer source uses checkpoint first, else fall back to run_card.
+    has_tok = any(
+        os.path.exists(os.path.join(path, fn))
+        for fn in ("tokenizer.json", "vocab.txt", "spiece.model")
+    )
     tok_src = path if has_tok else run_card.get("tokenizer_name", path)
 
-    tok = AutoTokenizer.from_pretrained(tok_src, use_fast=True)
-    mdl = AutoModelForSequenceClassification.from_pretrained(path)
-    mdl.eval()
+    pipe = _cached_pipe(path, tok_src, _cuda_ok())
 
-    device = torch.device("cuda" if _cuda_ok() else "cpu")
+    # Prefer labels from the model config (ground truth)
+    cfg = pipe.model.config
+    class_names = run_card.get("label_classes", [])
     try:
-        mdl.to(device)
+        num_labels = int(getattr(cfg, "num_labels", len(class_names) or 0))
+        id2label = getattr(cfg, "id2label", None)
+        if id2label and num_labels:
+            class_names = [
+                id2label[i] if isinstance(id2label, dict) and i in id2label
+                else id2label[str(i)] if isinstance(id2label, dict) and str(i) in id2label
+                else class_names[i] if i < len(class_names)
+                else f"LABEL_{i}"
+                for i in range(num_labels)
+            ]
+        elif not class_names and num_labels:
+            class_names = [f"LABEL_{i}" for i in range(num_labels)]
     except Exception:
-        device = torch.device("cpu"); mdl.to(device)
+        if not class_names:
+            class_names = ["admiration","amusement","anger","annoyance","approval","caring","confusion",
+                        "curiosity","desire","disappointment","disapproval","disgust","embarrassment",
+                        "excitement","fear","gratitude","grief","joy","love","nervousness","optimism",
+                        "pride","realization","relief","remorse","sadness","surprise","neutral"] # just a fallback
 
-    max_len = int(run_card.get("params", {}).get("max_len", 128))
+    name_to_idx = {n: i for i, n in enumerate(class_names)}
 
-    def predict(texts: List[str]) -> np.ndarray:
-        enc = tok(texts, truncation=True, padding=True, max_length=max_len, return_tensors="pt")
-        enc = {k: v.to(device) for k, v in enc.items()}
-        with torch.no_grad():
-            logits = mdl(**enc).logits
-        return logits.argmax(-1).cpu().numpy()
+    def _row_to_probs(row):
+        """
+        row is a list of dicts from the pipeline:
+          [{"label": "admiration", "score": 0.12}, ...]
+        Convert to a fixed-length vector aligned to class_names.
+        """
+        vec = np.zeros(len(class_names), dtype=np.float32)
+        for d in row:
+            lab = d["label"]
+            j = name_to_idx.get(lab)
+            if j is None and lab.startswith("LABEL_"):
+                try:
+                    j = int(lab.split("_")[-1])
+                except Exception:
+                    j = None
+            if j is not None and 0 <= j < len(vec):
+                vec[j] = float(d["score"])
+        s = float(vec.sum())
+        if s > 0:
+            vec /= s  # make sure sums to 1
+        return vec
 
     def predict_proba(texts: List[str]) -> np.ndarray:
-        enc = tok(texts, truncation=True, padding=True, max_length=max_len, return_tensors="pt")
-        enc = {k: v.to(device) for k, v in enc.items()}
-        with torch.no_grad():
-            logits = mdl(**enc).logits
-        return torch.softmax(logits, dim=-1).cpu().numpy()
+        outs = pipe(texts)
+        return np.vstack([_row_to_probs(row) for row in outs])
+
+    def predict(texts: List[str]) -> np.ndarray:
+        return predict_proba(texts).argmax(axis=-1)
 
     return predict, predict_proba, class_names, family
 
@@ -123,13 +137,13 @@ if not ALL_RUNS:
 run_ids_sorted = sorted(ALL_RUNS.keys())
 run_choice = st.sidebar.selectbox("Select checkpoint/run", run_ids_sorted, index=0 if run_ids_sorted else None)
 
-st.title("Sentiment / Emotion Model Viewer")
+st.title("Sentiment / Emotion Prediction")
 st.caption("Select a checkpoint and run a prediction on your text. See all runs and metrics in the second tab.")
 
-# Tabs: only Predict + All Runs
-tab_predict, tab_all = st.tabs(["Predict", "All Runs (Metrics)"])
+# Tabs
+tab_predict, tab_all = st.tabs(["Prediction", "Metrics (All models)"])
 
-# -------------------- PREDICT (single text only)
+# -------------------- PREDICT
 with tab_predict:
     if not run_choice:
         st.info("Pick a checkpoint on the left.")
@@ -142,9 +156,17 @@ with tab_predict:
         if st.button("Predict"):
             probs = predict_proba([text])[0]
             pred_id = int(np.argmax(probs))
-            st.success(f"Prediction: **{classes[pred_id]}**")
 
-            dfp = pd.DataFrame({"class": classes, "probability": probs})
+            #replace with words instead of label numbers
+            Emotions_28 = ["admiration","amusement","anger","annoyance","approval","caring","confusion",
+                        "curiosity","desire","disappointment","disapproval","disgust","embarrassment",
+                        "excitement","fear","gratitude","grief","joy","love","nervousness","optimism",
+                        "pride","realization","relief","remorse","sadness","surprise","neutral"]
+
+            display_classes = Emotions_28 if classes and classes[0].upper().startswith("LABEL_") else classes
+
+            st.success(f"Prediction: **{display_classes[pred_id]}**")
+            dfp = pd.DataFrame({"class": display_classes, "probability": probs})
             st.bar_chart(dfp.set_index("class"))
 
 # -------------------- ALL RUNS
@@ -158,13 +180,25 @@ with tab_all:
             m = rc.get("metrics", {})
             rows.append({
                 "run_id": rid,
-                "family": rc.get("family"),
+                # "family": rc.get("family"),
                 "model": rc.get("model_name"),
+                "tokenizer": rc.get("tokenizer_name"),
                 "accuracy": m.get("accuracy"),
-                "macro_f1": m.get("macro_f1"),
                 "n_classes": len(rc.get("label_classes", [])),
                 "path": rc.get("_path")
             })
-        df_runs = pd.DataFrame(rows).sort_values(["macro_f1", "accuracy"], ascending=[False, False])
+        df_runs = pd.DataFrame(rows).sort_values(["accuracy"], ascending=[False])
         st.dataframe(df_runs, use_container_width=True)
         st.download_button("Download runs table (CSV)", df_runs.to_csv(index=False), "all_runs.csv", "text/csv")
+
+        st.markdown("### Training loss plot")
+
+        IMG_PATH = Path(__file__).with_name("training_loss.jpg")
+
+        if IMG_PATH.exists():
+            # st.image(str(IMG_PATH), caption="Training Loss vs Epochs")
+            c1, c2, c3 = st.columns([1,2,1])
+            with c2:
+                st.image(str(IMG_PATH), caption="Training Loss vs Epochs", width=800)
+        else:
+            st.error(f"Image not found: {IMG_PATH}")
